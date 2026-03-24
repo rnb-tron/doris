@@ -21,6 +21,7 @@ import org.apache.doris.analysis.BinaryPredicate;
 import org.apache.doris.analysis.Expr;
 import org.apache.doris.analysis.ExprToSqlVisitor;
 import org.apache.doris.analysis.ExprToThriftVisitor;
+import org.apache.doris.analysis.InPredicate;
 import org.apache.doris.analysis.LiteralExpr;
 import org.apache.doris.analysis.SlotRef;
 import org.apache.doris.analysis.ToSqlParams;
@@ -150,7 +151,7 @@ public class PointQueryExecutor implements CoordInterface {
             StatementContext statementContext) throws Exception {
         Preconditions.checkNotNull(preparedStmtCtx.shortCircuitQueryContext);
         ShortCircuitQueryContext shortCircuitQueryContext = preparedStmtCtx.shortCircuitQueryContext.get();
-        // update conjuncts
+        // update conjuncts for equality predicates: colName -> LiteralExpr
         Map<String, Expr> colNameToConjunct = Maps.newHashMap();
         for (Entry<PlaceholderId, SlotReference> entry : statementContext.getIdToComparisonSlot().entrySet()) {
             String colName = entry.getValue().getOriginalColumn().get().getName();
@@ -158,13 +159,24 @@ public class PointQueryExecutor implements CoordInterface {
                     .get(entry.getKey())).toLegacyLiteral();
             colNameToConjunct.put(colName, conjunctVal);
         }
-        if (colNameToConjunct.size() != preparedStmtCtx.command.placeholderCount()) {
+        // update conjuncts for IN predicate: colName -> List<LiteralExpr>
+        Map<String, List<Expr>> colNameToInValues = Maps.newHashMap();
+        for (Entry<PlaceholderId, SlotReference> entry : statementContext.getIdToInPredicateSlot().entrySet()) {
+            String colName = entry.getValue().getOriginalColumn().get().getName();
+            Expr inVal = ((Literal) statementContext.getIdToPlaceholderRealExpr()
+                    .get(entry.getKey())).toLegacyLiteral();
+            colNameToInValues.computeIfAbsent(colName, k -> new ArrayList<>()).add(inVal);
+        }
+        int totalPlaceholderCount = preparedStmtCtx.command.placeholderCount();
+        int resolvedCount = colNameToConjunct.size() + colNameToInValues.values().stream()
+                .mapToInt(List::size).sum();
+        if (resolvedCount != totalPlaceholderCount) {
             throw new AnalysisException("Mismatched conjuncts values size with prepared"
                     + "statement parameters size, expected "
-                    + preparedStmtCtx.command.placeholderCount()
-                    + ", but meet " + colNameToConjunct.size());
+                    + totalPlaceholderCount
+                    + ", but meet " + resolvedCount);
         }
-        updateScanNodeConjuncts(shortCircuitQueryContext.scanNode, colNameToConjunct);
+        updateScanNodeConjuncts(shortCircuitQueryContext.scanNode, colNameToConjunct, colNameToInValues);
         // short circuit plan and execution
         executor.executeAndSendResult(false, false,
                 shortCircuitQueryContext.analzyedQuery, executor.getContext()
@@ -172,25 +184,41 @@ public class PointQueryExecutor implements CoordInterface {
     }
 
     private static void updateScanNodeConjuncts(OlapScanNode scanNode,
-                Map<String, Expr> colNameToConjunct) {
+                Map<String, Expr> colNameToConjunct, Map<String, List<Expr>> colNameToInValues) {
         for (Expr conjunct : scanNode.getConjuncts()) {
-            BinaryPredicate binaryPredicate = (BinaryPredicate) conjunct;
-            SlotRef slot = null;
-            int updateChildIdx = 0;
-            if (binaryPredicate.getChild(0) instanceof LiteralExpr) {
-                slot = (SlotRef) binaryPredicate.getChildWithoutCast(1);
-            } else if (binaryPredicate.getChild(1) instanceof LiteralExpr) {
-                slot = (SlotRef) binaryPredicate.getChildWithoutCast(0);
-                updateChildIdx = 1;
-            } else {
-                Preconditions.checkState(false, "Should contains literal in "
-                        + binaryPredicate.accept(ExprToSqlVisitor.INSTANCE, ToSqlParams.WITH_TABLE));
+            if (conjunct instanceof BinaryPredicate) {
+                BinaryPredicate binaryPredicate = (BinaryPredicate) conjunct;
+                SlotRef slot = null;
+                int updateChildIdx = 0;
+                if (binaryPredicate.getChild(0) instanceof LiteralExpr) {
+                    slot = (SlotRef) binaryPredicate.getChildWithoutCast(1);
+                } else if (binaryPredicate.getChild(1) instanceof LiteralExpr) {
+                    slot = (SlotRef) binaryPredicate.getChildWithoutCast(0);
+                    updateChildIdx = 1;
+                } else {
+                    Preconditions.checkState(false, "Should contains literal in "
+                            + binaryPredicate.accept(ExprToSqlVisitor.INSTANCE, ToSqlParams.WITH_TABLE));
+                }
+                // not a placeholder to replace
+                if (!colNameToConjunct.containsKey(slot.getColumnName())) {
+                    continue;
+                }
+                binaryPredicate.setChild(updateChildIdx, colNameToConjunct.get(slot.getColumnName()));
+            } else if (conjunct instanceof InPredicate) {
+                InPredicate inPredicate = (InPredicate) conjunct;
+                SlotRef slot = inPredicate.getChild(0).unwrapSlotRef();
+                if (slot == null || !colNameToInValues.containsKey(slot.getColumnName())) {
+                    continue;
+                }
+                List<Expr> newValues = colNameToInValues.get(slot.getColumnName());
+                // Replace all list children (children[1..n]) with the new literal values
+                while (inPredicate.getChildren().size() > 1) {
+                    inPredicate.getChildren().remove(inPredicate.getChildren().size() - 1);
+                }
+                for (Expr val : newValues) {
+                    inPredicate.addChild(val);
+                }
             }
-            // not a placeholder to replace
-            if (!colNameToConjunct.containsKey(slot.getColumnName())) {
-                continue;
-            }
-            binaryPredicate.setChild(updateChildIdx, colNameToConjunct.get(slot.getColumnName()));
         }
     }
 
@@ -200,15 +228,28 @@ public class PointQueryExecutor implements CoordInterface {
 
     void addKeyTuples(
             InternalService.PTabletKeyLookupRequest.Builder requestBuilder) throws TException {
-        // TODO handle IN predicates
-        Map<String, Expr> columnExpr = Maps.newHashMap();
-        KeyTuple.Builder kBuilder = KeyTuple.newBuilder();
+        // Separate equality predicates from IN predicates
+        Map<String, Expr> equalityColumnExpr = Maps.newHashMap();
+        Map<String, List<Expr>> inColumnExprs = Maps.newHashMap();
+
         for (Expr expr : shortCircuitQueryContext.scanNode.getConjuncts()) {
-            BinaryPredicate predicate = (BinaryPredicate) expr;
-            Expr left = predicate.getChild(0);
-            Expr right = predicate.getChild(1);
-            SlotRef columnSlot = left.unwrapSlotRef();
-            columnExpr.put(columnSlot.getColumnName(), right);
+            if (expr instanceof BinaryPredicate) {
+                BinaryPredicate predicate = (BinaryPredicate) expr;
+                Expr left = predicate.getChild(0);
+                Expr right = predicate.getChild(1);
+                SlotRef columnSlot = left.unwrapSlotRef();
+                equalityColumnExpr.put(columnSlot.getColumnName(), right);
+            } else if (expr instanceof InPredicate) {
+                InPredicate inPredicate = (InPredicate) expr;
+                SlotRef slot = inPredicate.getChild(0).unwrapSlotRef();
+                if (slot != null) {
+                    List<Expr> values = new ArrayList<>();
+                    for (int i = 1; i < inPredicate.getChildren().size(); i++) {
+                        values.add(inPredicate.getChild(i));
+                    }
+                    inColumnExprs.put(slot.getColumnName(), values);
+                }
+            }
         }
         // Serialize each literal expr as TExprNode bytes for typed value transfer.
         // BE deserializes the TExprNode and uses DataType::get_field() to extract
@@ -243,8 +284,52 @@ public class PointQueryExecutor implements CoordInterface {
             byte[] serialized = serializer.serialize(exprNode);
             kBuilder.addKeyColumnLiterals(
                     com.google.protobuf.ByteString.copyFrom(serialized));
+            if (expr instanceof BinaryPredicate) {
+                BinaryPredicate predicate = (BinaryPredicate) expr;
+                Expr left = predicate.getChild(0);
+                Expr right = predicate.getChild(1);
+                SlotRef columnSlot = left.unwrapSlotRef();
+                equalityColumnExpr.put(columnSlot.getColumnName(), right);
+            } else if (expr instanceof InPredicate) {
+                InPredicate inPredicate = (InPredicate) expr;
+                SlotRef slot = inPredicate.getChild(0).unwrapSlotRef();
+                if (slot != null) {
+                    List<Expr> values = new ArrayList<>();
+                    for (int i = 1; i < inPredicate.getChildren().size(); i++) {
+                        values.add(inPredicate.getChild(i));
+                    }
+                    inColumnExprs.put(slot.getColumnName(), values);
+                }
+            }
         }
-        requestBuilder.addKeyTuples(kBuilder);
+
+        List<Column> keyColumns = shortCircuitQueryContext.scanNode.getOlapTable().getBaseSchemaKeyColumns();
+
+        if (inColumnExprs.isEmpty()) {
+            // Pure equality case: generate one KeyTuple
+            KeyTuple.Builder kBuilder = KeyTuple.newBuilder();
+            for (Column column : keyColumns) {
+                kBuilder.addKeyColumnRep(equalityColumnExpr.get(column.getName()).getStringValue());
+            }
+            requestBuilder.addKeyTuples(kBuilder);
+        } else {
+            // IN predicate case: generate one KeyTuple per combination
+            // Find the IN column and its values, combine with equality columns
+            // Note: currently only supports single IN column per query (all keys must be covered)
+            String inColName = inColumnExprs.keySet().iterator().next();
+            List<Expr> inValues = inColumnExprs.get(inColName);
+            for (Expr inVal : inValues) {
+                KeyTuple.Builder kBuilder = KeyTuple.newBuilder();
+                for (Column column : keyColumns) {
+                    if (column.getName().equals(inColName)) {
+                        kBuilder.addKeyColumnRep(inVal.getStringValue());
+                    } else {
+                        kBuilder.addKeyColumnRep(equalityColumnExpr.get(column.getName()).getStringValue());
+                    }
+                }
+                requestBuilder.addKeyTuples(kBuilder);
+            }
+        }
     }
 
     @Override
